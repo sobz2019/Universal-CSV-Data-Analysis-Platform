@@ -1,690 +1,558 @@
-
 import dash
 from dash import dcc, html, dash_table, Input, Output, State
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-import base64
-import io
-import warnings
-warnings.filterwarnings('ignore')
+import base64, io, warnings
+warnings.filterwarnings("ignore")
 
-# Initialize the Dash app
-app = dash.Dash(__name__)
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
 
-# Helper functions for data analysis
+# ---------- Helpers ----------
 class DataAnalyzer:
-    def __init__(self, df):
+    def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.original_df = df.copy()
-        
+
     def clean_data(self):
-        """Perform automatic data cleaning"""
-        cleaning_report = []
-        
-        # Handle missing values
+        report = []
         for col in self.df.columns:
-            missing_pct = self.df[col].isnull().mean() * 100
-            
-            if missing_pct > 50:
-                cleaning_report.append(f"Column '{col}' has {missing_pct:.1f}% missing values - consider removing")
-            elif missing_pct > 0:
-                if self.df[col].dtype in ['int64', 'float64']:
+            miss = self.df[col].isna().mean() * 100
+            if miss > 50:
+                report.append(f"Column '{col}' has {miss:.1f}% missing values - consider removing")
+            elif miss > 0:
+                if self.df[col].dtype in ["int64", "float64"]:
                     self.df[col].fillna(self.df[col].median(), inplace=True)
-                    cleaning_report.append(f"Filled {missing_pct:.1f}% missing values in '{col}' with median")
+                    report.append(f"Filled {miss:.1f}% missing in '{col}' with median")
                 else:
                     mode_val = self.df[col].mode()
                     if len(mode_val) > 0:
                         self.df[col].fillna(mode_val[0], inplace=True)
-                        cleaning_report.append(f"Filled {missing_pct:.1f}% missing values in '{col}' with mode")
-        
-        # Remove duplicates
-        duplicates_before = self.df.duplicated().sum()
-        if duplicates_before > 0:
+                        report.append(f"Filled {miss:.1f}% missing in '{col}' with mode")
+        dups = self.df.duplicated().sum()
+        if dups > 0:
             self.df.drop_duplicates(inplace=True)
-            cleaning_report.append(f"Removed {duplicates_before} duplicate rows")
-        
-        if not cleaning_report:
-            cleaning_report.append("No cleaning operations needed - data is already clean!")
-        
-        return cleaning_report
-    
+            report.append(f"Removed {dups} duplicate rows")
+        if not report:
+            report.append("No cleaning required")
+        return report
+
     def generate_insights(self):
-        """Automatically generate insights from the data"""
-        insights = []
-        insights.append(f"Dataset contains {len(self.df)} rows and {len(self.df.columns)} columns")
-        
+        ins = [f"Dataset contains {len(self.df)} rows and {len(self.df.columns)} columns"]
         missing_cols = self.df.isnull().sum()
         missing_cols = missing_cols[missing_cols > 0]
-        if len(missing_cols) > 0:
-            insights.append(f"{len(missing_cols)} columns have missing values")
-        else:
-            insights.append("No missing values detected")
-        
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 0:
-            insights.append(f"Found {len(numeric_cols)} numeric columns for analysis")
-        
-        cat_cols = self.df.select_dtypes(include=['object']).columns
-        if len(cat_cols) > 0:
-            insights.append(f"Found {len(cat_cols)} categorical columns")
-        
-        return insights
+        ins.append("No missing values detected" if len(missing_cols) == 0 else f"{len(missing_cols)} columns have missing values")
+        num = self.df.select_dtypes(include=[np.number]).columns
+        cat = self.df.select_dtypes(include=["object"]).columns
+        if len(num) > 0: ins.append(f"Found {len(num)} numeric columns for analysis")
+        if len(cat) > 0: ins.append(f"Found {len(cat)} categorical columns")
+        return ins
+
+    def statistical_analysis(self):
+        results = {"correlations": [], "outliers": {}, "summary_stats": {}}
+        num_cols = self.df.select_dtypes(include=[np.number]).columns
+        if len(num_cols) > 1:
+            corr = self.df[num_cols].corr()
+            for i, c1 in enumerate(num_cols):
+                for j, c2 in enumerate(num_cols):
+                    if i < j:
+                        v = corr.loc[c1, c2]
+                        if not np.isnan(v) and abs(v) > 0.5:
+                            results["correlations"].append(
+                                {"var1": c1, "var2": c2, "correlation": round(v, 3),
+                                 "strength": "Strong" if abs(v) > 0.7 else "Moderate"}
+                            )
+        for col in num_cols:
+            data = self.df[col].dropna()
+            if len(data) == 0: 
+                continue
+            results["summary_stats"][col] = {
+                "mean": round(data.mean(), 2),
+                "median": round(data.median(), 2),
+                "std": round(data.std(), 2),
+                "min": round(data.min(), 2),
+                "max": round(data.max(), 2),
+            }
+            Q1, Q3 = data.quantile(0.25), data.quantile(0.75)
+            IQR = Q3 - Q1
+            outs = data[(data < Q1 - 1.5 * IQR) | (data > Q3 + 1.5 * IQR)]
+            results["outliers"][col] = {"count": len(outs), "percentage": round(len(outs) / len(data) * 100, 1)}
+        return results
+
+    def business_insights(self):
+        out = {"recommendations": [], "kpis": {}}
+        for col in self.df.select_dtypes(include=[np.number]).columns:
+            d = self.df[col].dropna()
+            if len(d) == 0: 
+                continue
+            out["kpis"][col] = {
+                "total": float(d.sum()),
+                "average": float(d.mean()),
+                "growth_potential": "High" if d.std() / (d.mean() if d.mean() else 1) > 0.5 else "Low",
+            }
+        out["recommendations"] = [
+            "📊 Review high-variance columns for data quality issues",
+            "🔍 Investigate correlations between key variables",
+            "📈 Segment analysis by categorical variables",
+            "⚠️ Address outliers that may skew analysis results",
+        ]
+        return out
 
 def parse_uploaded_file(contents, filename):
-    """Parse uploaded CSV file with better encoding handling"""
-    content_type, content_string = contents.split(',')
+    content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
-    
     try:
-        if 'csv' in filename:
-            for encoding in ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']:
+        if "csv" in filename.lower():
+            for enc in ["utf-8", "latin-1", "iso-8859-1", "cp1252"]:
                 try:
-                    df = pd.read_csv(io.StringIO(decoded.decode(encoding)))
-                    return df, f"Successfully loaded {filename} with {len(df)} rows and {len(df.columns)} columns"
+                    df = pd.read_csv(io.StringIO(decoded.decode(enc)))
+                    return df, f"Loaded {filename} ({len(df)} rows, {len(df.columns)} cols)"
                 except UnicodeDecodeError:
                     continue
-            
-            df = pd.read_csv(io.StringIO(decoded.decode('utf-8', errors='ignore')))
-            return df, f"Loaded {filename} (some characters may be corrupted due to encoding issues)"
-        else:
-            return None, "Please upload a CSV file"
-        
+            df = pd.read_csv(io.StringIO(decoded.decode("utf-8", errors="ignore")))
+            return df, f"Loaded {filename} (best-effort encoding)"
+        return None, "Please upload a CSV file"
     except Exception as e:
-        return None, f"Error loading file: {str(e)}"
+        return None, f"Error loading file: {e}"
 
-# App layout - ALL components defined upfront
-app.layout = html.Div([
-    # Data stores
-    dcc.Store(id='dataset'),
-    dcc.Store(id='analysis-info'),
-    
-    # Header
-    html.Div([
-        html.H1("🔍 Universal CSV Data Analysis Platform", 
-                style={'textAlign': 'center', 'color': '#2c3e50', 'marginBottom': 10}),
-        html.P("Upload any CSV file for automatic cleaning, analysis, and visualization",
-               style={'textAlign': 'center', 'color': '#7f8c8d', 'fontSize': 16})
-    ], style={'marginBottom': 30}),
-    
-    # Upload section
-    html.Div([
-        dcc.Upload(
-            id='csv-upload',
-            children=html.Div([
-                '📁 Drag and Drop or Click to Select CSV File'
-            ], style={'fontSize': 18}),
-            style={
-                'width': '100%', 'height': '100px', 'lineHeight': '100px',
-                'borderWidth': '2px', 'borderStyle': 'dashed', 'borderRadius': '10px',
-                'textAlign': 'center', 'margin': '10px', 'borderColor': '#3498db',
-                'backgroundColor': '#ecf0f1', 'cursor': 'pointer'
-            },
-            multiple=False
+# ---------- UI builders ----------
+def create_complete_dashboard(df, analysis):
+    return [
+        dcc.Tabs(
+            id="nav-tabs",
+            value="overview",
+            children=[
+                dcc.Tab(label="📊 Overview", value="overview"),
+                dcc.Tab(label="📈 Charts", value="charts"),
+                dcc.Tab(label="🗺️ Maps", value="maps"),
+                dcc.Tab(label="📊 Statistics", value="stats"),
+                dcc.Tab(label="💡 Insights", value="insights"),
+                dcc.Tab(label="📋 Data", value="data"),
+            ],
+            style={"marginBottom": 20},
         ),
-        html.Div(id='upload-message', style={'textAlign': 'center', 'marginTop': 10})
-    ], style={'marginBottom': 30}),
-    
-    # Main content area - all components defined here
-    html.Div(id='main-area', children=[
-        # Navigation tabs
-        dcc.Tabs(id='tabs', value='summary', children=[
-            dcc.Tab(label='📊 Summary', value='summary'),
-            dcc.Tab(label='📈 Charts', value='charts'),
-            dcc.Tab(label='🗺️ Maps', value='maps'),
-            dcc.Tab(label='📋 Data', value='data')
-        ], style={'marginBottom': 20}),
-        
-        # Tab content area
-        html.Div(id='tab-display', children=[
-            # Summary tab content
-            html.Div(id='summary-tab', children=[], style={'display': 'none'}),
-            
-            # Charts tab content
-            html.Div(id='charts-tab', children=[
-                html.H3("📈 Interactive Visualizations", style={'color': '#2c3e50'}),
-                
-                # Chart controls - all defined here
-                html.Div([
-                    html.Div([
-                        html.Label("Chart Type:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(
-                            id='chart-selector',
-                            options=[
-                                {'label': 'Histogram', 'value': 'histogram'},
-                                {'label': 'Box Plot', 'value': 'box'},
-                                {'label': 'Scatter Plot', 'value': 'scatter'},
-                                {'label': 'Bar Chart', 'value': 'bar'},
-                                {'label': 'Line Chart', 'value': 'line'},
-                                {'label': 'Correlation Heatmap', 'value': 'heatmap'}
-                            ],
-                            value='bar'  # Changed default to bar chart
-                        )
-                    ], style={'width': '30%', 'display': 'inline-block', 'marginRight': '5%'}),
-                    
-                    html.Div([
-                        html.Label("X-Axis:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='x-axis', value=None)
-                    ], style={'width': '30%', 'display': 'inline-block', 'marginRight': '5%'}),
-                    
-                    html.Div([
-                        html.Label("Y-Axis:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='y-axis', value=None)
-                    ], style={'width': '30%', 'display': 'inline-block'})
-                ], style={'marginBottom': 10}),
-                
-                # Chart recommendations
-                html.Div(id='chart-recommendations', style={'marginBottom': 10, 'padding': 10, 'backgroundColor': '#e8f4f8', 'borderRadius': 5}),
-                
-                dcc.Graph(id='chart-output', style={'height': 600})
-            ], style={'display': 'none'}),
-            
-            # Maps tab content
-            html.Div(id='maps-tab', children=[
-                html.H3("🗺️ Geographic Visualization", style={'color': '#2c3e50'}),
-                
-                html.P("Create region-based heat maps or coordinate-based scatter maps:", 
-                       style={'marginBottom': 20, 'fontStyle': 'italic'}),
-                
-                # Map type selector
-                html.Div([
-                    html.Label("Map Type:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                    dcc.RadioItems(
-                        id='map-selector',
-                        options=[
-                            {'label': ' Region Heat Map', 'value': 'region'},
-                            {'label': ' Coordinate Map', 'value': 'coords'}
-                        ],
-                        value='region',
-                        inline=True,
-                        style={'marginBottom': 15}
-                    )
-                ]),
-                
-                # Map controls - all defined here
-                html.Div([
-                    html.Div([
-                        html.Label("Location Column:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='location-col', value=None)
-                    ], style={'width': '22%', 'display': 'inline-block', 'marginRight': '4%'}),
-                    
-                    html.Div([
-                        html.Label("Value Column:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='value-col', value=None)
-                    ], style={'width': '22%', 'display': 'inline-block', 'marginRight': '4%'}),
-                    
-                    html.Div([
-                        html.Label("Latitude:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='lat-col', value=None)
-                    ], style={'width': '22%', 'display': 'inline-block', 'marginRight': '4%'}),
-                    
-                    html.Div([
-                        html.Label("Longitude:", style={'fontWeight': 'bold', 'marginBottom': '5px'}),
-                        dcc.Dropdown(id='lon-col', value=None)
-                    ], style={'width': '22%', 'display': 'inline-block'})
-                ], style={'marginBottom': 20}),
-                
-                dcc.Graph(id='map-output', style={'height': 600})
-            ], style={'display': 'none'}),
-            
-            # Data tab content
-            html.Div(id='data-tab', children=[
-                html.H3("📋 Data Explorer", style={'color': '#2c3e50'}),
-                html.Div(id='data-info'),
-                html.Div(id='data-display')
-            ], style={'display': 'none'})
+        html.Div([
+            html.Div(id="overview-content",  children=create_overview_content(df, analysis)),
+            html.Div(id="charts-content",    children=create_charts_content(df, analysis),  style={"display": "none"}),
+            html.Div(id="maps-content",      children=create_maps_content(df, analysis),    style={"display": "none"}),
+            html.Div(id="stats-content",     children=create_statistics_content(df, analysis), style={"display": "none"}),
+            html.Div(id="insights-content",  children=create_insights_content(df, analysis), style={"display": "none"}),
+            html.Div(id="data-content",      children=create_data_content(df),              style={"display": "none"}),
         ])
-    ], style={'display': 'none'})
-    
-], style={'padding': 20, 'fontFamily': 'Arial, sans-serif'})
+    ]
 
-# File upload callback
+def create_overview_content(df, analysis):
+    return [
+        html.H3("📊 Dataset Overview", style={"color":"#2c3e50"}),
+        html.Div([
+            html.Div([html.H2(f"{len(df)}", style={"color":"#e74c3c","margin":0,"textAlign":"center"}),
+                      html.P("Total Rows", style={"margin":0,"textAlign":"center"})], className="summary-card"),
+            html.Div([html.H2(f"{len(df.columns)}", style={"color":"#3498db","margin":0,"textAlign":"center"}),
+                      html.P("Total Columns", style={"margin":0,"textAlign":"center"})], className="summary-card"),
+            html.Div([html.H2(f"{df.isnull().sum().sum()}", style={"color":"#f39c12","margin":0,"textAlign":"center"}),
+                      html.P("Missing Values", style={"margin":0,"textAlign":"center"})], className="summary-card"),
+            html.Div([html.H2(f"{len(analysis['numeric_cols'])}", style={"color":"#27ae60","margin":0,"textAlign":"center"}),
+                      html.P("Numeric Columns", style={"margin":0,"textAlign":"center"})], className="summary-card"),
+        ], className="summary-row"),
+        html.H3("🧹 Data Cleaning Report", style={"color":"#2c3e50","marginTop":30}),
+        html.Div([html.Ul([html.Li(i) for i in analysis["cleaning_report"]])], className="report-box"),
+        html.H3("💡 Quick Insights", style={"color":"#2c3e50","marginTop":30}),
+        html.Div([html.Ul([html.Li(x) for x in analysis["insights"]])], className="report-box"),
+        html.H3("📋 Column Details", style={"color":"#2c3e50","marginTop":30}),
+        dash_table.DataTable(
+            data=[{"Column":c,"Type":str(df[c].dtype),"Unique":df[c].nunique(),
+                   "Missing":df[c].isnull().sum(),
+                   "Sample":str(df[c].dropna().iloc[0]) if df[c].dropna().shape[0]>0 else "N/A"} for c in df.columns],
+            columns=[{"name":n,"id":n} for n in ["Column","Type","Unique","Missing","Sample"]],
+            style_cell={"textAlign":"left","padding":"10px"},
+            style_header={"backgroundColor":"#3498db","color":"white","fontWeight":"bold"},
+            page_size=15
+        )
+    ]
+
+def create_charts_content(df, analysis):
+    numeric_cols = analysis["numeric_cols"]
+    all_cols = list(df.columns)
+
+    return [
+        html.H3("📈 Interactive Data Visualizations", style={"color": "#2c3e50"}),
+
+        # Controls (3 columns)
+        html.Div([
+            html.Div([
+                html.Label("Chart Type:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                dcc.Dropdown(
+                    id="chart-type-selector",
+                    options=[{"label": t, "value": v} for t, v in [
+                        ("Bar Chart", "bar"),
+                        ("Histogram", "histogram"),
+                        ("Box Plot", "box"),
+                        ("Scatter Plot", "scatter"),
+                        ("Line Chart", "line"),
+                        ("Correlation Heatmap", "heatmap"),
+                    ]],
+                    value="bar",
+                ),
+            ], style={"width": "30%", "display": "inline-block", "marginRight": "5%"}),
+
+            html.Div([
+                html.Label("X-Axis Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                dcc.Dropdown(
+                    id="chart-x-axis",
+                    options=[{"label": c, "value": c} for c in all_cols],
+                    value=all_cols[0] if all_cols else None,
+                ),
+            ], style={"width": "30%", "display": "inline-block", "marginRight": "5%"}),
+
+            html.Div([
+                html.Label("Y-Axis Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                dcc.Dropdown(
+                    id="chart-y-axis",
+                    options=[{"label": c, "value": c} for c in all_cols],
+                    value=(numeric_cols[0] if numeric_cols else (all_cols[1] if len(all_cols) > 1 else None)),
+                ),
+            ], style={"width": "30%", "display": "inline-block"}),
+        ], style={"marginBottom": 20}),  # <-- controls Div CLOSED here
+
+        # Suggestions + chart (siblings of the controls Div)
+        html.Div(
+            id="chart-recommendations",
+            style={"marginBottom": 15, "padding": 10, "backgroundColor": "#e8f4f8", "borderRadius": 5},
+        ),
+        dcc.Graph(id="dynamic-chart", style={"height": 600}),
+    ]
+
+
+def create_maps_content(df, analysis):
+    numeric_cols = analysis["numeric_cols"]
+    all_cols = list(df.columns)
+    return [
+        html.H3("🗺️ Geographic Analysis", style={"color":"#2c3e50"}),
+        html.P("Create interactive maps and regional analysis:", style={"marginBottom":20,"fontStyle":"italic"}),
+        html.Div([html.Label("Map Type:", style={"fontWeight":"bold","marginBottom":"5px"}),
+                  dcc.RadioItems(id="map-type-selector",
+                                 options=[{"label":" Choropleth Heat Map","value":"choropleth"},
+                                          {"label":" Regional Bar Chart","value":"bar"},
+                                          {"label":" Scatter Map Points","value":"scatter"}],
+                                 value="choropleth", inline=True, style={"marginBottom":15})]),
+        html.Div([
+            html.Div([html.Label("Location/Region Column:", style={"fontWeight":"bold","marginBottom":"5px"}),
+                      dcc.Dropdown(id="map-location-col",
+                                   options=[{"label":c,"value":c} for c in all_cols],
+                                   value=all_cols[0] if all_cols else None)],
+                     style={"width":"30%","display":"inline-block","marginRight":"5%"}),
+            html.Div([html.Label("Value Column (for coloring/sizing):", style={"fontWeight":"bold","marginBottom":"5px"}),
+                      dcc.Dropdown(id="map-value-col",
+                                   options=[{"label":c,"value":c} for c in numeric_cols],
+                                   value=numeric_cols[0] if numeric_cols else None)],
+                     style={"width":"30%","display":"inline-block","marginRight":"5%"}),
+            html.Div([html.Label("Latitude (for Scatter):", style={"fontWeight":"bold","marginBottom":"5px"}),
+                      dcc.Dropdown(id="map-lat-col", options=[{"label":c,"value":c} for c in all_cols], value=None, disabled=True)],
+                     style={"width":"17%","display":"inline-block","marginRight":"3%"}),
+            html.Div([html.Label("Longitude (for Scatter):", style={"fontWeight":"bold","marginBottom":"5px"}),
+                      dcc.Dropdown(id="map-lon-col", options=[{"label":c,"value":c} for c in all_cols], value=None, disabled=True)],
+                     style={"width":"17%","display":"inline-block"}),
+        ], style={"marginBottom":20}),
+        dcc.Graph(id="interactive-map", style={"height":600})
+    ]
+
+def create_statistics_content(df, analysis):
+    stats_results = analysis.get("statistical_results", {})
+    content = [html.H3("📊 Statistical Analysis", style={"color":"#2c3e50"})]
+    correlations = stats_results.get("correlations", [])
+    if correlations:
+        content += [html.H4("🔗 Significant Correlations", style={"color":"#34495e"}),
+                    dash_table.DataTable(
+                        data=correlations,
+                        columns=[{"name":"Variable 1","id":"var1"},{"name":"Variable 2","id":"var2"},
+                                 {"name":"Correlation","id":"correlation"},{"name":"Strength","id":"strength"}],
+                        style_header={"backgroundColor":"#3498db","color":"white"},
+                        style_cell={"textAlign":"left","padding":"10px"})]
+    summary_stats = stats_results.get("summary_stats", {})
+    if summary_stats:
+        rows = [{"Variable":c,"Mean":s["mean"],"Median":s["median"],"Std Dev":s["std"],"Min":s["min"],"Max":s["max"]}
+                for c,s in summary_stats.items()]
+        content += [html.H4("📈 Summary Statistics", style={"color":"#34495e","marginTop":30}),
+                    dash_table.DataTable(
+                        data=rows, columns=[{"name":k,"id":k} for k in rows[0].keys()],
+                        style_header={"backgroundColor":"#27ae60","color":"white"},
+                        style_cell={"textAlign":"left","padding":"10px"})]
+    outliers = stats_results.get("outliers", {})
+    if outliers:
+        rows = [{"Variable":c,"Outlier Count":v["count"],"Outlier %":v["percentage"]} for c,v in outliers.items()]
+        content += [html.H4("⚠️ Outlier Analysis", style={"color":"#34495e","marginTop":30}),
+                    dash_table.DataTable(
+                        data=rows, columns=[{"name":k,"id":k} for k in rows[0].keys()],
+                        style_header={"backgroundColor":"#e74c3c","color":"white"},
+                        style_cell={"textAlign":"left","padding":"10px"})]
+    if not correlations and not summary_stats:
+        content.append(html.P("Statistical analysis requires numeric data columns.", style={"textAlign":"center","padding":20}))
+    return content
+
+def create_insights_content(df, analysis):
+    biz = analysis.get("business_insights", {})
+    content = [html.H3("💡 Business Insights & KPIs", style={"color":"#2c3e50"})]
+    kpis = biz.get("kpis", {})
+    if kpis:
+        cards = []
+        for col, k in list(kpis.items())[:4]:
+            cards.append(html.Div([
+                html.H5(col, style={"margin":0,"color":"white"}),
+                html.H3(f"{k['total']:,.0f}", style={"margin":0,"color":"white"}),
+                html.P(f"Average: {k['average']:.1f}", style={"margin":0,"color":"rgba(255,255,255,0.8)"}),
+                html.P(f"Growth Potential: {k['growth_potential']}", style={"margin":0,"fontSize":12,"color":"rgba(255,255,255,0.8)"})
+            ], className="kpi-card"))
+        content += [html.H4("📊 Key Performance Indicators", style={"color":"#34495e"}), html.Div(cards, className="kpi-row")]
+    recs = biz.get("recommendations", [])
+    if recs:
+        content += [html.H4("💡 Strategic Recommendations", style={"color":"#34495e","marginTop":30}),
+                    html.Div([html.Ul([html.Li(r, style={"marginBottom":8}) for r in recs])], className="report-box")]
+    if not kpis and not recs:
+        content.append(html.P("Business insights will be generated based on your data structure.", style={"textAlign":"center","padding":20}))
+    return content
+
+def create_data_content(df):
+    return [
+        html.H3("📋 Data Explorer", style={"color":"#2c3e50"}),
+        html.P(f"Displaying first 100 rows of {len(df)} total rows", style={"fontStyle":"italic","marginBottom":15}),
+        dash_table.DataTable(
+            data=df.head(100).to_dict("records"),
+            columns=[{"name":c,"id":c} for c in df.columns],
+            style_cell={"textAlign":"left","padding":"8px","maxWidth":"150px","overflow":"hidden","textOverflow":"ellipsis"},
+            style_header={"backgroundColor":"#3498db","color":"white","fontWeight":"bold"},
+            page_size=25, sort_action="native", filter_action="native", style_table={"overflowX":"auto"})
+    ]
+
+# ---------- Layout ----------
+app.layout = html.Div([
+    dcc.Store(id="dataset"),
+    dcc.Store(id="analysis-results"),
+    html.H1("🔍 Universal CSV Data Analysis Platform", style={"textAlign":"center","color":"#2c3e50","marginBottom":10}),
+    html.P("Upload any CSV file for automatic cleaning, analysis, and visualization",
+           style={"textAlign":"center","color":"#7f8c8d","fontSize":16,"marginBottom":30}),
+    dcc.Upload(id="upload-csv",
+               children=html.Div(["📁 Drag and Drop or Click to Select CSV File"], style={"fontSize":18}),
+               style={"width":"100%","height":"100px","lineHeight":"100px","borderWidth":"2px","borderStyle":"dashed",
+                      "borderRadius":"10px","textAlign":"center","margin":"10px","borderColor":"#3498db",
+                      "backgroundColor":"#ecf0f1","cursor":"pointer"},
+               multiple=False),
+    html.Div(id="status-message", style={"textAlign":"center","marginTop":10}),
+    html.Div(id="dashboard", style={"display":"none"})
+], style={"padding":20,"fontFamily":"Arial, sans-serif"})
+
+# ---------- Callbacks ----------
 @app.callback(
-    [Output('dataset', 'data'),
-     Output('analysis-info', 'data'),
-     Output('upload-message', 'children'),
-     Output('main-area', 'style'),
-     Output('x-axis', 'options'),
-     Output('y-axis', 'options'),
-     Output('location-col', 'options'),
-     Output('value-col', 'options'),
-     Output('lat-col', 'options'),
-     Output('lon-col', 'options'),
-     Output('x-axis', 'value'),
-     Output('y-axis', 'value'),
-     Output('value-col', 'value')],
-    [Input('csv-upload', 'contents')],
-    [State('csv-upload', 'filename')]
+    [Output("dataset","data"),
+     Output("analysis-results","data"),
+     Output("status-message","children"),
+     Output("dashboard","style"),
+     Output("dashboard","children")],
+    Input("upload-csv","contents"),
+    State("upload-csv","filename")
 )
-def handle_upload(contents, filename):
+def handle_file_upload(contents, filename):
     if contents is None:
-        empty_options = []
-        return {}, {}, "", {'display': 'none'}, empty_options, empty_options, empty_options, empty_options, empty_options, empty_options, None, None, None
-    
-    # Parse file
-    df, status_msg = parse_uploaded_file(contents, filename)
-    
+        return {}, {}, "", {"display":"none"}, []
+    df, status = parse_uploaded_file(contents, filename)
     if df is None:
-        empty_options = []
-        return {}, {}, html.Div(status_msg, style={'color': 'red'}), {'display': 'none'}, empty_options, empty_options, empty_options, empty_options, empty_options, empty_options, None, None, None
-    
-    # Analyze data
+        return {}, {}, html.Div(status, style={"color":"red"}), {"display":"none"}, []
+
     analyzer = DataAnalyzer(df)
-    cleaning_report = analyzer.clean_data()
-    insights = analyzer.generate_insights()
-    
-    # Prepare data
     analysis_data = {
-        'cleaning_report': cleaning_report,
-        'insights': insights,
-        'numeric_cols': list(analyzer.df.select_dtypes(include=[np.number]).columns),
-        'categorical_cols': list(analyzer.df.select_dtypes(include=['object']).columns)
+        "cleaning_report": analyzer.clean_data(),
+        "insights": analyzer.generate_insights(),
+        "numeric_cols": list(analyzer.df.select_dtypes(include=[np.number]).columns),
+        "categorical_cols": list(analyzer.df.select_dtypes(include=["object"]).columns),
+        "statistical_results": analyzer.statistical_analysis(),
+        "business_insights": analyzer.business_insights()
     }
-    
-    # Create dropdown options
-    all_cols = [{'label': col, 'value': col} for col in analyzer.df.columns]
-    numeric_cols = [{'label': col, 'value': col} for col in analysis_data['numeric_cols']]
-    
-    # Ensure we have numeric columns, if not, use all columns
-    if not numeric_cols:
-        numeric_cols = all_cols
-    
-    # Set default values
-    default_x = analyzer.df.columns[0] if len(analyzer.df.columns) > 0 else None
-    default_y = analyzer.df.columns[1] if len(analyzer.df.columns) > 1 else None
-    default_value = analysis_data['numeric_cols'][0] if analysis_data['numeric_cols'] else None
-    
-    success_msg = html.Div("✅ " + status_msg, style={'color': 'green', 'fontWeight': 'bold'})
-    
-    return (analyzer.df.to_dict('records'), analysis_data, success_msg, {'display': 'block'}, 
-            all_cols, all_cols, all_cols, numeric_cols, numeric_cols, numeric_cols,
-            default_x, default_y, default_value)
+    layout = create_complete_dashboard(analyzer.df, analysis_data)
+    msg = html.Div("✅ " + status, style={"color":"green","fontWeight":"bold"})
+    return analyzer.df.to_dict("records"), analysis_data, msg, {"display":"block"}, layout
 
-# Tab display callback
 @app.callback(
-    [Output('summary-tab', 'style'),
-     Output('charts-tab', 'style'),
-     Output('maps-tab', 'style'),
-     Output('data-tab', 'style'),
-     Output('summary-tab', 'children')],
-    [Input('tabs', 'value'),
-     Input('dataset', 'data'),
-     Input('analysis-info', 'data')]
+    [Output("overview-content","style"),
+     Output("charts-content","style"),
+     Output("maps-content","style"),
+     Output("stats-content","style"),
+     Output("insights-content","style"),
+     Output("data-content","style")],
+    Input("nav-tabs","value")
 )
-def display_tab(active_tab, data, analysis):
-    # Set all tabs to hidden first
-    hidden = {'display': 'none'}
-    visible = {'display': 'block'}
-    
-    # Determine which tab to show
-    summary_style = visible if active_tab == 'summary' else hidden
-    charts_style = visible if active_tab == 'charts' else hidden
-    maps_style = visible if active_tab == 'maps' else hidden
-    data_style = visible if active_tab == 'data' else hidden
-    
-    # Generate summary content
-    summary_content = []
-    if data and analysis:
-        df = pd.DataFrame(data)
-        
-        # Summary cards
-        summary_content = [
-            html.H3("📊 Dataset Summary", style={'color': '#2c3e50'}),
-            html.Div([
-                html.Div([
-                    html.H2(f"{len(df)}", style={'color': '#e74c3c', 'margin': 0, 'textAlign': 'center'}),
-                    html.P("Total Rows", style={'margin': 0, 'textAlign': 'center'})
-                ], className='summary-card'),
-                
-                html.Div([
-                    html.H2(f"{len(df.columns)}", style={'color': '#3498db', 'margin': 0, 'textAlign': 'center'}),
-                    html.P("Total Columns", style={'margin': 0, 'textAlign': 'center'})
-                ], className='summary-card'),
-                
-                html.Div([
-                    html.H2(f"{df.isnull().sum().sum()}", style={'color': '#f39c12', 'margin': 0, 'textAlign': 'center'}),
-                    html.P("Missing Values", style={'margin': 0, 'textAlign': 'center'})
-                ], className='summary-card'),
-                
-                html.Div([
-                    html.H2(f"{len(analysis['numeric_cols'])}", style={'color': '#27ae60', 'margin': 0, 'textAlign': 'center'}),
-                    html.P("Numeric Columns", style={'margin': 0, 'textAlign': 'center'})
-                ], className='summary-card')
-            ], className='summary-row'),
-            
-            # Cleaning report
-            html.H3("🧹 Data Cleaning Report", style={'color': '#2c3e50', 'marginTop': 30}),
-            html.Div([
-                html.Ul([html.Li(item) for item in analysis['cleaning_report']])
-            ], className='report-box'),
-            
-            # Insights
-            html.H3("💡 Automatic Insights", style={'color': '#2c3e50', 'marginTop': 30}),
-            html.Div([
-                html.Ul([html.Li(insight) for insight in analysis['insights']])
-            ], className='report-box'),
-            
-            # Column info
-            html.H3("📋 Column Information", style={'color': '#2c3e50', 'marginTop': 30}),
-            dash_table.DataTable(
-                data=[{
-                    'Column': col,
-                    'Type': str(df[col].dtype),
-                    'Unique': df[col].nunique(),
-                    'Missing': df[col].isnull().sum(),
-                    'Missing %': f"{(df[col].isnull().sum() / len(df) * 100):.1f}%"
-                } for col in df.columns],
-                columns=[
-                    {'name': 'Column Name', 'id': 'Column'},
-                    {'name': 'Data Type', 'id': 'Type'},
-                    {'name': 'Unique Values', 'id': 'Unique'},
-                    {'name': 'Missing Values', 'id': 'Missing'},
-                    {'name': 'Missing %', 'id': 'Missing %'}
-                ],
-                style_cell={'textAlign': 'left', 'padding': '10px'},
-                style_header={'backgroundColor': '#3498db', 'color': 'white', 'fontWeight': 'bold'},
-                page_size=15
-            )
-        ]
-    
-    return summary_style, charts_style, maps_style, data_style, summary_content
+def switch_tabs(active):
+    styles = [{"display":"none"}]*6
+    idx = {"overview":0,"charts":1,"maps":2,"stats":3,"insights":4,"data":5}.get(active,0)
+    styles[idx] = {"display":"block"}
+    return styles
 
-# Chart callback
 @app.callback(
-    Output('chart-output', 'figure'),
-    [Input('chart-selector', 'value'),
-     Input('x-axis', 'value'),
-     Input('y-axis', 'value'),
-     Input('dataset', 'data')]
+    Output("dynamic-chart","figure"),
+    [Input("chart-type-selector","value"),
+     Input("chart-x-axis","value"),
+     Input("chart-y-axis","value"),
+     Input("dataset","data")]
 )
-def update_chart(chart_type, x_col, y_col, data):
+def update_dynamic_chart(chart_type, x_col, y_col, data):
     if not data or not x_col:
-        return go.Figure().add_annotation(
-            text="Select data and X-axis column to generate chart", 
-            showarrow=False, xref="paper", yref="paper", 
-            x=0.5, y=0.5, font_size=16
-        )
-    
+        return go.Figure().add_annotation(text="Upload a CSV, then pick X/Y.", showarrow=False, x=0.5, y=0.5)
     df = pd.DataFrame(data)
-    
     try:
-        if chart_type == 'histogram':
-            fig = px.histogram(df, x=x_col, title=f'Distribution of {x_col}')
-            
-        elif chart_type == 'box':
-            if y_col and y_col != x_col:
-                fig = px.box(df, x=x_col, y=y_col, title=f'{y_col} by {x_col}')
-            else:
-                fig = px.box(df, y=x_col, title=f'Box Plot of {x_col}')
-                
-        elif chart_type == 'scatter' and y_col and y_col != x_col:
-            fig = px.scatter(df, x=x_col, y=y_col, title=f'{y_col} vs {x_col}')
-            
-        elif chart_type == 'bar':
-            if df[x_col].dtype == 'object' and y_col and y_col != x_col:
-                # Aggregate data by category and sum the values
-                bar_data = df.groupby(x_col)[y_col].sum().reset_index()
-                bar_data = bar_data.sort_values(y_col, ascending=False).head(20)
-                fig = px.bar(bar_data, x=x_col, y=y_col, 
-                           title=f'Total {y_col} by {x_col}')
-                fig.update_xaxes(tickangle=45)
-            elif df[x_col].dtype == 'object':
-                value_counts = df[x_col].value_counts().head(20)
-                fig = px.bar(x=value_counts.index, y=value_counts.values, 
-                           title=f'Count of {x_col}',
-                           labels={'x': x_col, 'y': 'Count'})
-                fig.update_xaxes(tickangle=45)
-            else:
-                fig = px.histogram(df, x=x_col, title=f'Distribution of {x_col}')
-                
-        elif chart_type == 'line' and y_col and y_col != x_col:
-            # For line charts with categorical X-axis, aggregate and sort data
-            if df[x_col].dtype == 'object':
-                line_data = df.groupby(x_col)[y_col].sum().reset_index()
-                line_data = line_data.sort_values(y_col)  # Sort by Y values for meaningful line
-                fig = px.line(line_data, x=x_col, y=y_col, 
-                            title=f'Total {y_col} by {x_col} (Sorted by Value)')
-                fig.update_xaxes(tickangle=45)
-            else:
-                fig = px.line(df.sort_values(x_col), x=x_col, y=y_col, 
-                            title=f'{y_col} over {x_col}')
-                            
-        elif chart_type == 'heatmap':
-            numeric_df = df.select_dtypes(include=[np.number])
-            if len(numeric_df.columns) > 1:
-                corr_matrix = numeric_df.corr()
-                fig = px.imshow(corr_matrix, text_auto=True, aspect="auto",
-                              title="Correlation Heatmap", color_continuous_scale='RdBu')
-            else:
-                fig = go.Figure().add_annotation(
-                    text="Need at least 2 numeric columns for correlation heatmap", 
-                    showarrow=False, xref="paper", yref="paper", 
-                    x=0.5, y=0.5, font_size=14
-                )
-        else:
-            fig = px.histogram(df, x=x_col, title=f'Distribution of {x_col}')
-        
-        return fig
+        if chart_type == "histogram":
+            return px.histogram(df, x=x_col, title=f"Distribution of {x_col}")
+        if chart_type == "box":
+            return px.box(df, x=x_col, y=y_col) if y_col and y_col != x_col else px.box(df, y=x_col)
+        if chart_type == "scatter" and y_col and y_col != x_col:
+            return px.scatter(df, x=x_col, y=y_col, title=f"{y_col} vs {x_col}")
+        if chart_type == "bar":
+            if df[x_col].dtype == "object" and y_col and y_col != x_col:
+                tmp = df.groupby(x_col)[y_col].sum(numeric_only=True).reset_index().sort_values(y_col, ascending=False).head(20)
+                fig = px.bar(tmp, x=x_col, y=y_col, title=f"Total {y_col} by {x_col}")
+                fig.update_xaxes(tickangle=45); return fig
+            if df[x_col].dtype == "object":
+                vc = df[x_col].value_counts().head(20)
+                fig = px.bar(x=vc.index, y=vc.values, labels={"x":x_col,"y":"Count"}, title=f"Count of {x_col}")
+                fig.update_xaxes(tickangle=45); return fig
+            return px.histogram(df, x=x_col, title=f"Distribution of {x_col}")
+        if chart_type == "line" and y_col and y_col != x_col:
+            if df[x_col].dtype == "object":
+                tmp = df.groupby(x_col)[y_col].sum(numeric_only=True).reset_index().sort_values(y_col)
+                fig = px.line(tmp, x=x_col, y=y_col, title=f"Total {y_col} by {x_col}")
+                fig.update_xaxes(tickangle=45); return fig
+            return px.line(df.sort_values(x_col), x=x_col, y=y_col, title=f"{y_col} over {x_col}")
+        if chart_type == "heatmap":
+            num = df.select_dtypes(include=[np.number])
+            if num.shape[1] > 1:
+                return px.imshow(num.corr(), text_auto=True, aspect="auto", title="Correlation Heatmap", color_continuous_scale="RdBu")
+            return go.Figure().add_annotation(text="Need ≥2 numeric columns for heatmap", showarrow=False, x=0.5, y=0.5)
+        return px.histogram(df, x=x_col, title=f"Distribution of {x_col}")
     except Exception as e:
-        return go.Figure().add_annotation(
-            text=f"Error generating chart: {str(e)}", 
-            showarrow=False, xref="paper", yref="paper", 
-            x=0.5, y=0.5, font_size=14
-        )
+        return go.Figure().add_annotation(text=f"Chart error: {e}", showarrow=False, x=0.5, y=0.5)
 
-# Map callback
 @app.callback(
-    Output('map-output', 'figure'),
-    [Input('map-selector', 'value'),
-     Input('location-col', 'value'),
-     Input('value-col', 'value'),
-     Input('lat-col', 'value'),
-     Input('lon-col', 'value'),
-     Input('dataset', 'data')]
+    Output("chart-recommendations","children"),
+    [Input("chart-x-axis","value"),
+     Input("chart-y-axis","value"),
+     Input("dataset","data")]
 )
-def update_map(map_type, location_col, value_col, lat_col, lon_col, data):
-    if not data:
-        return go.Figure().add_annotation(
-            text="No data available for mapping", 
-            showarrow=False, xref="paper", yref="paper", 
-            x=0.5, y=0.5, font_size=16
-        )
-    
-    df = pd.DataFrame(data)
-    
-    try:
-        if map_type == 'region' and location_col and value_col:
-            # Region-based heat map
-            map_data = df.groupby(location_col)[value_col].sum().reset_index()
-            map_data = map_data.sort_values(value_col, ascending=False)
-            
-            # Try different location modes
-            location_modes = ['country names', 'ISO-3', 'USA-states']
-            fig = None
-            
-            for mode in location_modes:
-                try:
-                    fig = go.Figure(data=go.Choropleth(
-                        locations=map_data[location_col],
-                        z=map_data[value_col],
-                        locationmode=mode,
-                        colorscale='Blues',
-                        text=map_data[location_col],
-                        colorbar_title=value_col,
-                        hovertemplate=f'<b>%{{text}}</b><br>{value_col}: %{{z:,.0f}}<extra></extra>'
-                    ))
-                    
-                    fig.update_layout(
-                        title=f'{value_col} by {location_col}',
-                        geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular')
-                    )
-                    break  # Success, exit loop
-                except Exception:
-                    continue  # Try next mode
-            
-            if fig is None:
-                # If choropleth fails, create a bar chart as fallback
-                fig = px.bar(map_data.head(20), x=location_col, y=value_col,
-                           title=f'Top 20 {location_col} by {value_col} (Geographic map unavailable)')
-                fig.update_xaxes(tickangle=45)
-            
-        elif map_type == 'coords' and lat_col and lon_col:
-            # Coordinate-based map
-            hover_data = [location_col] if location_col else []
-            
-            fig = px.scatter_mapbox(
-                df,
-                lat=lat_col,
-                lon=lon_col,
-                color=value_col if value_col else None,
-                size=value_col if value_col else None,
-                hover_data=hover_data,
-                title="Geographic Distribution",
-                mapbox_style="open-street-map",
-                zoom=3,
-                height=600
-            )
-        else:
-            instruction = "⚙️ Select appropriate columns:\n\n"
-            if map_type == 'region':
-                instruction += "✓ Location Column: Choose column with region/country names\n"
-                instruction += "✓ Value Column: Choose numeric column for heat map intensity\n\n"
-                instruction += "💡 Tip: Works best with country names, state names, or ISO codes"
-            else:
-                instruction += "✓ Latitude Column: Choose column with latitude coordinates\n"
-                instruction += "✓ Longitude Column: Choose column with longitude coordinates\n"
-                instruction += "• Optional: Value Column for color/size coding"
-            
-            fig = go.Figure()
-            fig.add_annotation(
-                text=instruction, 
-                showarrow=False, xref="paper", yref="paper", 
-                x=0.5, y=0.5, font_size=14, align="left"
-            )
-            fig.update_layout(
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-                plot_bgcolor='white'
-            )
-        
-        return fig
-    except Exception as e:
-        return go.Figure().add_annotation(
-            text=f"Error generating map: {str(e)}\n\nTip: Ensure location names match standard country/state names", 
-            showarrow=False, xref="paper", yref="paper", 
-            x=0.5, y=0.5, font_size=14
-        )
-
-# Chart recommendations callback
-@app.callback(
-    Output('chart-recommendations', 'children'),
-    [Input('x-axis', 'value'),
-     Input('y-axis', 'value'),
-     Input('dataset', 'data')]
-)
-def update_chart_recommendations(x_col, y_col, data):
+def chart_recs(x_col, y_col, data):
     if not data or not x_col:
         return ""
-    
     df = pd.DataFrame(data)
-    recommendations = []
-    
-    x_is_categorical = df[x_col].dtype == 'object'
-    y_is_categorical = y_col and df[y_col].dtype == 'object' if y_col else False
-    y_is_numeric = y_col and df[y_col].dtype in ['int64', 'float64'] if y_col else False
-    
-    if x_is_categorical and y_is_numeric:
-        recommendations.append("💡 Recommended: Bar Chart - Perfect for showing numeric values by category")
-    elif not x_is_categorical and y_is_numeric:
-        recommendations.append("💡 Recommended: Scatter Plot or Line Chart - Great for numeric relationships")
-    elif x_is_categorical and not y_col:
-        recommendations.append("💡 Recommended: Bar Chart - Shows frequency of categories")
-    elif not x_is_categorical and not y_col:
-        recommendations.append("💡 Recommended: Histogram - Shows distribution of numeric data")
-    
-    if x_is_categorical and y_is_numeric:
-        recommendations.append("⚠️ Line Chart may not be meaningful with categorical X-axis")
-    
-    if recommendations:
-        return html.Div([
-            html.P("📊 Chart Suggestions:", style={'fontWeight': 'bold', 'margin': 0, 'color': '#2c3e50'}),
-            html.Ul([html.Li(rec, style={'fontSize': 12}) for rec in recommendations], style={'margin': 5})
-        ])
-    
-    return ""
+    recs = []
+    x_cat = df[x_col].dtype == "object"
+    y_num = y_col and (df[y_col].dtype in ["int64","float64"])
+    if x_cat and y_num:
+        recs += ["💡 Bar chart is ideal: numeric by category.", "⚠️ Line chart is rarely meaningful with categorical X."]
+    elif (not x_cat) and y_num:
+        recs.append("💡 Scatter/line works well for numeric↔numeric.")
+    elif x_cat and not y_col:
+        recs.append("💡 Bar chart of category counts.")
+    return html.Div([html.P("📊 Suggestions:", style={"fontWeight":"bold","margin":0}),
+                     html.Ul([html.Li(r) for r in recs], style={"margin":5})])
 
-# Data display callback
 @app.callback(
-    [Output('data-info', 'children'),
-     Output('data-display', 'children')],
-    [Input('dataset', 'data')]
+    [Output("map-lat-col","disabled"),
+     Output("map-lon-col","disabled")],
+    Input("map-type-selector","value")
 )
-def update_data_display(data):
-    if not data:
-        return "", ""
-    
-    df = pd.DataFrame(data)
-    
-    info = html.P(f"Showing first 100 rows of {len(df)} total rows", 
-                  style={'fontStyle': 'italic', 'marginBottom': 15})
-    
-    table = dash_table.DataTable(
-        data=df.head(100).to_dict('records'),
-        columns=[{'name': col, 'id': col} for col in df.columns],
-        style_cell={'textAlign': 'left', 'padding': '8px', 'maxWidth': '150px', 'overflow': 'hidden'},
-        style_header={'backgroundColor': '#3498db', 'color': 'white', 'fontWeight': 'bold'},
-        page_size=20,
-        sort_action='native',
-        filter_action='native',
-        style_table={'overflowX': 'auto'}
-    )
-    
-    return info, table
+def enable_scatter_coords(map_type):
+    is_scatter = (map_type == "scatter")
+    return (not is_scatter), (not is_scatter)
 
-# CSS styling
-app.index_string = '''
+@app.callback(
+    Output("interactive-map","figure"),
+    [Input("map-type-selector","value"),
+     Input("map-location-col","value"),
+     Input("map-value-col","value"),
+     Input("map-lat-col","value"),
+     Input("map-lon-col","value"),
+     Input("dataset","data")]
+)
+def update_interactive_map(map_type, loc_col, val_col, lat_col, lon_col, data):
+    if not data:
+        return go.Figure().add_annotation(text="Upload data to map.", showarrow=False, x=0.5, y=0.5)
+    df = pd.DataFrame(data)
+
+    # Try to coerce value column numeric if present
+    if val_col is not None and val_col in df.columns:
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+    try:
+        if map_type == "choropleth" and loc_col and val_col:
+            agg = df.groupby(loc_col, dropna=True)[val_col].sum(min_count=1).reset_index()
+            if agg[val_col].notna().sum() == 0:
+                return go.Figure().add_annotation(text="Value column must be numeric for choropleth.", showarrow=False, x=0.5, y=0.5)
+            for mode in ["country names", "ISO-3", "ISO-2", "USA-states"]:
+                try:
+                    fig = go.Figure(go.Choropleth(
+                        locations=agg[loc_col], z=agg[val_col],
+                        locationmode=mode, colorscale="Blues", text=agg[loc_col],
+                        colorbar_title=str(val_col),
+                        hovertemplate="<b>%{text}</b><br>"+str(val_col)+": %{z:,.0f}<extra></extra>"
+                    ))
+                    fig.update_layout(title=f"{val_col} by {loc_col}",
+                                      geo=dict(showframe=False, showcoastlines=True, projection_type="equirectangular"))
+                    return fig
+                except Exception:
+                    continue
+            # Fallback: regional bar chart
+            tmp = agg.sort_values(val_col, ascending=False).head(25)
+            fig = px.bar(tmp, x=loc_col, y=val_col, title=f"{val_col} by {loc_col} (map fallback)")
+            fig.update_xaxes(tickangle=45)
+            return fig
+
+        if map_type == "bar" and loc_col and val_col:
+            tmp = df.groupby(loc_col, dropna=True)[val_col].sum(min_count=1).reset_index().sort_values(val_col, ascending=False).head(30)
+            fig = px.bar(tmp, x=loc_col, y=val_col, title=f"{val_col} by {loc_col}")
+            fig.update_xaxes(tickangle=45)
+            return fig
+
+        if map_type == "scatter" and lat_col and lon_col:
+            return px.scatter_mapbox(
+                df.dropna(subset=[lat_col, lon_col]),
+                lat=lat_col, lon=lon_col,
+                color=val_col if val_col else None,
+                size=val_col if val_col else None,
+                hover_data=[loc_col] if loc_col else None,
+                mapbox_style="open-street-map", zoom=3, height=600,
+                title="Geographic Distribution"
+            )
+
+        txt = ("For Choropleth: choose a region column (country/state names or ISO codes) and a **numeric** value column.<br>"
+               "For Scatter: choose Latitude and Longitude columns.")
+        return go.Figure().add_annotation(text=txt, showarrow=False, x=0.5, y=0.5)
+    except Exception as e:
+        return go.Figure().add_annotation(text=f"Map error: {e}", showarrow=False, x=0.5, y=0.5)
+
+# ---------- Styling ----------
+app.index_string = """
 <!DOCTYPE html>
 <html>
-    <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
-        <style>
-            .summary-row {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 15px;
-                margin-bottom: 20px;
-            }
-            .summary-card {
-                background-color: #f8f9fa;
-                padding: 20px;
-                border-radius: 10px;
-                text-align: center;
-                flex: 1;
-                min-width: 150px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }
-            .report-box {
-                background-color: #f8f9fa;
-                padding: 15px;
-                border-radius: 8px;
-                border-left: 4px solid #3498db;
-            }
-        </style>
-    </head>
-    <body>
-        {%app_entry%}
-        <footer>
-            {%config%}
-            {%scripts%}
-            {%renderer%}
-        </footer>
-    </body>
+  <head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <style>
+      .summary-row { display:flex; flex-wrap:wrap; gap:15px; margin-bottom:20px; }
+      .summary-card { background:#f8f9fa; padding:20px; border-radius:10px; text-align:center; flex:1; min-width:150px; box-shadow:0 2px 4px rgba(0,0,0,0.1); }
+      .report-box { background:#f8f9fa; padding:15px; border-radius:8px; border-left:4px solid #3498db; margin-bottom:15px; }
+      .kpi-row { display:flex; flex-wrap:wrap; gap:15px; margin-bottom:20px; }
+      .kpi-card { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); color:white; padding:20px; border-radius:12px; flex:1; min-width:200px; box-shadow:0 4px 8px rgba(0,0,0,0.1); transition: transform .2s; }
+      .kpi-card:hover { transform: translateY(-2px); }
+    </style>
+  </head>
+  <body>
+    {%app_entry%}
+    <footer>
+      {%config%}
+      {%scripts%}
+      {%renderer%}
+    </footer>
+  </body>
 </html>
-'''
+"""
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True, port=8050)
