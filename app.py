@@ -4,6 +4,7 @@ import re
 import json
 import base64
 import warnings
+import math
 
 import dash
 from dash import dcc, html, dash_table, Input, Output, State
@@ -14,114 +15,6 @@ import pandas as pd
 import numpy as np
 
 warnings.filterwarnings("ignore")
-
-# Optional: requests is only needed for fetching GeoJSON from URLs
-try:
-    import requests
-except Exception:  # pragma: no cover
-    requests = None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GeoJSON helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def parse_geojson_text(text: str):
-    try:
-        return json.loads(text)
-    except Exception as e:
-        raise ValueError(f"Invalid GeoJSON: {e}")
-
-
-def get_local_geojson(path: str):
-    """Try to load a GeoJSON from disk if present."""
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def get_uk_lad_geojson():
-    """
-    Prefer a local file over the network. Then try multiple public URLs.
-    Returns (geojson, source_label). Raises on failure.
-    """
-    # 1) Local file (drop one into assets/ or data/ to be offline-safe)
-    for p in ["assets/uk_lad.geojson", "data/uk_lad.geojson"]:
-        gj = get_local_geojson(p)
-        if gj:
-            return gj, f"local:{p}"
-
-    # 2) Public mirrors (paths may change; we try several)
-    if requests is None:
-        raise RuntimeError("GeoJSON fetch requires 'requests'. Upload a file or add 'requests' to dependencies.")
-
-    candidates = [
-        # Community mirror (contains `name` and `code` in properties)
-        "https://raw.githubusercontent.com/ajparsons/geojson-uk/master/json/la.json",
-        # Older mirrors kept as fallbacks (may 404)
-        "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/lad.json",
-        "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/localauthority/lad.json",
-    ]
-
-    last_err = None
-    for url in candidates:
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            gj = r.json()
-            if isinstance(gj, dict) and gj.get("features"):
-                return gj, url
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(f"Could not fetch UK GeoJSON from fallback list. Last error: {last_err}")
-
-
-def fetch_geojson(url: str):
-    if requests is None:
-        raise RuntimeError("Custom/UK GeoJSON fetch needs 'requests'. Add it to your dependencies.")
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def infer_featureidkey(geojson: dict, id_series: pd.Series):
-    """
-    Try to find which GeoJSON property best matches the given ID column values.
-    Returns a featureidkey like 'properties.LAD23CD' or 'properties.name', or None.
-    """
-    ids = set(str(v).strip().upper() for v in id_series.dropna().astype(str))
-    if not ids:
-        return None
-
-    counts = {}
-    for feat in geojson.get("features", []):
-        props = feat.get("properties", {}) or {}
-        for k, v in props.items():
-            if v is None:
-                continue
-            if str(v).strip().upper() in ids:
-                counts[k] = counts.get(k, 0) + 1
-
-    if not counts:
-        return None
-    best_key = max(counts, key=counts.get)
-    return f"properties.{best_key}"
-
-
-def guess_locationmode(series: pd.Series) -> str:
-    """Heuristics to pick country names vs ISO-2 vs ISO-3 for world choropleths."""
-    vals = series.dropna().astype(str).str.strip()
-    up = vals.str.upper()
-    is_iso3 = (up.str.len() == 3) & up.str.match(r"^[A-Z]{3}$")
-    is_iso2 = (up.str.len() == 2) & up.str.match(r"^[A-Z]{2}$")
-    if is_iso3.mean() > 0.8:
-        return "ISO-3"
-    if is_iso2.mean() > 0.8:
-        return "ISO-2"
-    return "country names"
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App + Data helpers
@@ -239,6 +132,71 @@ def parse_uploaded_file(contents, filename):
         return None, f"Error loading file: {e}"
 
 
+def guess_location_type(series: pd.Series) -> str:
+    """Determine if locations are country names, ISO codes, state names/codes, or UK regions"""
+    vals = series.dropna().astype(str).str.strip()
+    if len(vals) == 0:
+        return "unknown"
+    
+    sample_vals = vals.head(20).str.upper()
+    
+    # Check for ISO-3 codes (3 letters, all caps)
+    iso3_mask = (vals.str.len() == 3) & vals.str.match(r'^[A-Z]{3}$', case=False)
+    if iso3_mask.mean() > 0.7:
+        return "ISO-3"
+    
+    # Check for ISO-2 codes (2 letters, all caps)
+    iso2_mask = (vals.str.len() == 2) & vals.str.match(r'^[A-Z]{2}$', case=False)
+    if iso2_mask.mean() > 0.7:
+        return "ISO-2"
+    
+    # Check for US state abbreviations
+    us_state_abbrev = {'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA', 
+                       'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                       'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                       'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                       'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'}
+    
+    us_matches = sum(1 for val in sample_vals if val in us_state_abbrev)
+    if us_matches / len(sample_vals) > 0.5:
+        return "USA-states"
+    
+    # Check for common US state names
+    us_state_names = {'CALIFORNIA', 'TEXAS', 'FLORIDA', 'NEW YORK', 'PENNSYLVANIA', 
+                      'ILLINOIS', 'OHIO', 'GEORGIA', 'NORTH CAROLINA', 'MICHIGAN',
+                      'VIRGINIA', 'WASHINGTON', 'ARIZONA', 'MASSACHUSETTS', 'TENNESSEE'}
+    us_name_matches = sum(1 for val in sample_vals if val in us_state_names)
+    if us_name_matches / len(sample_vals) > 0.3:
+        return "USA-states"
+    
+    # Check for UK regions/councils (common patterns)
+    uk_indicators = {
+        # Common UK council/region patterns
+        'COUNCIL', 'BOROUGH', 'DISTRICT', 'COUNTY', 'CITY OF', 'ROYAL BOROUGH',
+        # Major UK cities/regions
+        'LONDON', 'BIRMINGHAM', 'MANCHESTER', 'GLASGOW', 'LIVERPOOL', 'BRISTOL',
+        'LEEDS', 'SHEFFIELD', 'CARDIFF', 'BELFAST', 'NOTTINGHAM', 'NEWCASTLE',
+        # UK specific suffixes
+        'UPON', 'TYNE', 'AVON', 'THAMES', 'WOLDS', 'MOOR', 'DALE', 'SHIRE'
+    }
+    
+    # Check if any values contain UK indicators
+    uk_matches = 0
+    for val in sample_vals:
+        if any(indicator in val for indicator in uk_indicators):
+            uk_matches += 1
+    
+    if uk_matches / len(sample_vals) > 0.3:
+        return "UK-regions"
+    
+    # Check for UK postcode patterns (first part)
+    postcode_pattern = vals.str.match(r'^[A-Z]{1,2}[0-9]{1,2}[A-Z]?$', case=False)
+    if postcode_pattern.mean() > 0.5:
+        return "UK-postcodes"
+    
+    return "country names"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UI builders
 # ──────────────────────────────────────────────────────────────────────────────
@@ -354,107 +312,126 @@ def create_maps_content(df, analysis):
     all_cols = list(df.columns)
 
     return [
-        html.H3("🗺️ Geographic Analysis", style={"color":"#2c3e50"}),
-        html.P("Create choropleth heat maps for countries/US states, UK local authorities, your own GeoJSON regions, or scatter maps from latitude/longitude.",
-               style={"marginBottom":20,"fontStyle":"italic"}),
+        html.H3("🗺️ Geographic Analysis", style={"color": "#2c3e50"}),
+        html.P("Create interactive choropleth maps and heat map visualizations", 
+               style={"marginBottom": 20, "fontStyle": "italic"}),
 
-        # High-level map type + geography scope
+        # Map type selector with heat map emphasis
+        html.Div([
+            html.Label("Visualization Type:", style={"fontWeight": "bold", "marginBottom": "10px"}),
+            dcc.RadioItems(
+                id="map-type-selector",
+                options=[
+                    {"label": " 🌍 World Choropleth", "value": "world_choropleth"},
+                    {"label": " 🇺🇸 US States Choropleth", "value": "usa_choropleth"},
+                    {"label": " 🇬🇧 UK Interactive Heat Maps", "value": "uk_choropleth"},
+                    {"label": " 📍 Scatter Map (Lat/Lon)", "value": "scatter_map"},
+                    {"label": " 📊 Regional Bar Chart", "value": "regional_bar"},
+                ],
+                value="world_choropleth",
+                inline=False,
+                style={"marginBottom": 20}
+            ),
+        ]),
+
+        # Heat map style selector (only for UK)
+        html.Div(id="uk-heatmap-controls", children=[
+            html.Label("UK Heat Map Style:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+            dcc.RadioItems(
+                id="uk-heatmap-style",
+                options=[
+                    {"label": " 🔥 Treemap Heat Map (Recommended)", "value": "treemap"},
+                    {"label": " ⬜ Matrix Grid Heat Map", "value": "matrix"},
+                    {"label": " 📊 Horizontal Bars", "value": "bars"}
+                ],
+                value="treemap",
+                inline=True,
+                style={"marginBottom": 15}
+            ),
+            html.Small(
+                "Treemap: Interactive rectangles sized by value • Matrix: Traditional grid heat map • Bars: Simple comparison",
+                style={"color": "#6c757d", "display": "block"}
+            ),
+        ], style={"display": "none", "marginBottom": 15, "padding": "10px", "backgroundColor": "#f8f9fa", "borderRadius": "5px"}),
+
+        # Column selectors
         html.Div([
             html.Div([
-                html.Label("Map Type:", style={"fontWeight":"bold"}),
-                dcc.RadioItems(
-                    id="map-type-selector",
-                    options=[
-                        {"label":" Choropleth Heat Map", "value":"choropleth"},
-                        {"label":" Regional Bar Chart", "value":"bar"},
-                        {"label":" Scatter Map Points", "value":"scatter"},
-                    ],
-                    value="choropleth", inline=True
-                ),
-            ], style={"width":"48%", "display":"inline-block", "verticalAlign":"top"}),
-
-            html.Div([
-                html.Label("Geography:", style={"fontWeight":"bold"}),
+                html.Label("Location Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
                 dcc.Dropdown(
-                    id="geo-scope",
-                    options=[
-                        {"label": "World (countries)", "value": "world"},
-                        {"label": "USA (states)", "value": "usa"},
-                        {"label": "UK (Local Authorities — auto)", "value": "uk_auto"},
-                        {"label": "Custom GeoJSON", "value": "custom"},
-                    ],
-                    value="world",
-                    clearable=False,
-                ),
-            ], style={"width":"48%", "display":"inline-block", "marginLeft":"4%"}),
-        ], style={"marginBottom":15}),
-
-        # Core selectors (always visible)
-        html.Div([
-            html.Div([
-                html.Label("Location/Region Column:", style={"fontWeight":"bold", "marginBottom":"5px"}),
-                dcc.Dropdown(id="map-location-col",
-                             options=[{"label":c,"value":c} for c in all_cols],
-                             value=all_cols[0] if all_cols else None),
-            ], style={"width":"30%","display":"inline-block","marginRight":"5%"}),
-
-            html.Div([
-                html.Label("Value Column (for coloring/sizing):", style={"fontWeight":"bold", "marginBottom":"5px"}),
-                dcc.Dropdown(id="map-value-col",
-                             options=[{"label":c,"value":c} for c in numeric_cols],
-                             value=numeric_cols[0] if numeric_cols else None),
-            ], style={"width":"30%","display":"inline-block","marginRight":"5%"}),
-
-            html.Div([
-                html.Label("Latitude (for Scatter):", style={"fontWeight":"bold","marginBottom":"5px"}),
-                dcc.Dropdown(id="map-lat-col", options=[{"label":c,"value":c} for c in all_cols], value=None, disabled=True),
-            ], style={"width":"16%","display":"inline-block","marginRight":"2%"}),
-
-            html.Div([
-                html.Label("Longitude (for Scatter):", style={"fontWeight":"bold","marginBottom":"5px"}),
-                dcc.Dropdown(id="map-lon-col", options=[{"label":c,"value":c} for c in all_cols], value=None, disabled=True),
-            ], style={"width":"16%","display":"inline-block"}),
-        ], style={"marginBottom":10}),
-
-        # Custom/UK overrides: upload or URL + featureid
-        html.Div(id="custom-geo-controls", children=[
-            html.Div([
-                html.Label("GeoJSON URL:", style={"fontWeight":"bold"}),
-                dcc.Input(id="geojson-url", type="text", placeholder="https://.../your_regions.geojson", style={"width":"100%"}),
-            ], style={"width":"38%","display":"inline-block","marginRight":"2%"}),
-
-            html.Div([
-                html.Label("Feature ID property (featureidkey):", style={"fontWeight":"bold"}),
-                dcc.Input(id="geojson-featureid", type="text", value="",  # leave empty to auto-detect
-                          placeholder="e.g., properties.name or properties.LAD23CD", style={"width":"100%"}),
-            ], style={"width":"30%","display":"inline-block","marginRight":"2%"}),
-
-            html.Div([
-                html.Label("Your column that matches the feature ID:", style={"fontWeight":"bold"}),
-                dcc.Dropdown(id="custom-id-col", options=[{"label":c,"value":c} for c in all_cols],
-                             value=all_cols[0] if all_cols else None),
-            ], style={"width":"28%","display":"inline-block"}),
-
-            html.Div([
-                html.Label("Or upload a GeoJSON file:", style={"fontWeight":"bold", "display":"block", "marginTop":"8px"}),
-                dcc.Upload(
-                    id="geojson-upload",
-                    children=html.Div(["📄 Drag & drop or click to select a .geojson file"]),
-                    multiple=False,
-                    style={
-                        "width":"100%","height":"58px","lineHeight":"58px","borderWidth":"1px",
-                        "borderStyle":"dashed","borderRadius":"6px","textAlign":"center",
-                        "backgroundColor":"#fafafa","cursor":"pointer"
-                    },
+                    id="map-location-col",
+                    options=[{"label": c, "value": c} for c in all_cols],
+                    value=all_cols[0] if all_cols else None,
+                    placeholder="Select region/country/state column"
                 ),
                 html.Small(
-                    "Tip: place a file at assets/uk_lad.geojson to load automatically without network.",
-                    style={"color":"#6c757d"}
-                )
-            ], style={"width":"100%","marginTop":"6px"}),
-        ], style={"marginBottom":15, "backgroundColor":"#f8f9fa", "padding":"10px", "borderRadius":"8px", "display":"none"}),
+                    "For World: country names, ISO-2 (US, GB) or ISO-3 (USA, GBR) codes",
+                    style={"color": "#6c757d", "display": "block", "marginTop": "2px"}
+                ),
+                html.Small(
+                    "For US: state names (California) or abbreviations (CA)",
+                    style={"color": "#6c757d", "display": "block"}
+                ),
+                html.Small(
+                    "For UK: council names, borough names, or region names",
+                    style={"color": "#6c757d", "display": "block"}
+                ),
+            ], style={"width": "48%", "display": "inline-block", "marginRight": "4%"}),
 
-        dcc.Graph(id="interactive-map", style={"height":600}),
+            html.Div([
+                html.Label("Value Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                dcc.Dropdown(
+                    id="map-value-col",
+                    options=[{"label": c, "value": c} for c in numeric_cols],
+                    value=numeric_cols[0] if numeric_cols else None,
+                    placeholder="Select numeric column for heat map coloring"
+                ),
+                html.Small(
+                    "Numeric column used for heat map intensity and coloring",
+                    style={"color": "#6c757d", "display": "block", "marginTop": "2px"}
+                ),
+            ], style={"width": "48%", "display": "inline-block"}),
+        ], style={"marginBottom": 15}),
+
+        # Lat/Lon selectors (only shown for scatter maps)
+        html.Div(id="scatter-controls", children=[
+            html.Div([
+                html.Div([
+                    html.Label("Latitude Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                    dcc.Dropdown(
+                        id="map-lat-col",
+                        options=[{"label": c, "value": c} for c in all_cols],
+                        value=None,
+                        placeholder="Select latitude column"
+                    ),
+                ], style={"width": "48%", "display": "inline-block", "marginRight": "4%"}),
+
+                html.Div([
+                    html.Label("Longitude Column:", style={"fontWeight": "bold", "marginBottom": "5px"}),
+                    dcc.Dropdown(
+                        id="map-lon-col",
+                        options=[{"label": c, "value": c} for c in all_cols],
+                        value=None,
+                        placeholder="Select longitude column"
+                    ),
+                ], style={"width": "48%", "display": "inline-block"}),
+            ]),
+        ], style={"display": "none", "marginBottom": 15}),
+
+        # Map insights
+        html.Div(
+            id="map-insights",
+            style={
+                "marginBottom": 15, 
+                "padding": 10, 
+                "backgroundColor": "#e8f4f8", 
+                "borderRadius": 5,
+                "minHeight": "40px"
+            },
+        ),
+
+        # The map
+        dcc.Graph(id="interactive-map", style={"height": 600}),
     ]
 
 
@@ -534,7 +511,6 @@ def create_data_content(df):
 app.layout = html.Div([
     dcc.Store(id="dataset"),
     dcc.Store(id="analysis-results"),
-    dcc.Store(id="geojson-store"),  # holds uploaded geojson (and tiny error messages)
 
     html.H1("🔍 Universal CSV Data Analysis Platform", style={"textAlign":"center","color":"#2c3e50","marginBottom":10}),
     html.P("Upload any CSV file for automatic cleaning, analysis, and visualization",
@@ -667,225 +643,373 @@ def chart_recs(x_col, y_col, data):
                      html.Ul([html.Li(r) for r in recs], style={"margin":5})])
 
 
-# GeoJSON upload → store
+# Maps - Updated callbacks with heat map support
 @app.callback(
-    Output("geojson-store", "data"),
-    Input("geojson-upload", "contents"),
-    State("geojson-upload", "filename"),
-    prevent_initial_call=True
+    [Output("scatter-controls", "style"),
+     Output("uk-heatmap-controls", "style")],
+    Input("map-type-selector", "value")
 )
-def load_geojson_from_upload(contents, filename):
-    if not contents:
-        return dash.no_update
+def toggle_map_controls(map_type):
+    scatter_style = {"display": "block", "marginBottom": 15} if map_type == "scatter_map" else {"display": "none", "marginBottom": 15}
+    uk_style = {"display": "block", "marginBottom": 15, "padding": "10px", "backgroundColor": "#f8f9fa", "borderRadius": "5px"} if map_type == "uk_choropleth" else {"display": "none"}
+    return scatter_style, uk_style
+
+
+@app.callback(
+    Output("map-insights", "children"),
+    [Input("map-type-selector", "value"),
+     Input("map-location-col", "value"),
+     Input("map-value-col", "value"),
+     Input("dataset", "data")]
+)
+def update_map_insights(map_type, loc_col, val_col, data):
+    if not data or not loc_col:
+        return html.P("Select your data columns to see mapping insights.", 
+                     style={"margin": 0, "color": "#6c757d"})
+    
+    df = pd.DataFrame(data)
+    insights = []
+    
     try:
-        header, encoded = contents.split(",", 1)
-        gj_text = base64.b64decode(encoded).decode("utf-8", errors="ignore")
-        gj = parse_geojson_text(gj_text)
-        return {"source": f"upload:{filename}", "geojson": gj}
+        if map_type in ["world_choropleth", "usa_choropleth", "uk_choropleth"] and loc_col:
+            location_type = guess_location_type(df[loc_col])
+            unique_locations = df[loc_col].nunique()
+            
+            insights.append(f"📍 Detected {unique_locations} unique locations")
+            insights.append(f"🎯 Location format appears to be: {location_type}")
+            
+            if val_col:
+                val_data = pd.to_numeric(df[val_col], errors="coerce")
+                valid_values = val_data.notna().sum()
+                total_values = len(df)
+                insights.append(f"📊 {valid_values}/{total_values} rows have valid numeric values")
+                
+                if map_type == "uk_choropleth":
+                    insights.append("🔥 Heat map will show intensity by region size and color")
+        
+        elif map_type == "scatter_map":
+            insights.append("📍 Scatter maps require latitude and longitude columns")
+            insights.append("💡 Points will be sized and colored by the value column")
+        
+        elif map_type == "regional_bar":
+            if loc_col and val_col:
+                try:
+                    val_data = pd.to_numeric(df[val_col], errors="coerce")
+                    agg_data = df.groupby(loc_col)[val_col].sum()
+                    if len(agg_data) > 0:
+                        top_region = agg_data.idxmax()
+                        top_value = agg_data.max()
+                        insights.append(f"📊 Top region: {top_region} ({top_value:,.0f})")
+                except:
+                    insights.append("📊 Select numeric value column for regional analysis")
+    
     except Exception as e:
-        return {"error": f"GeoJSON upload error: {e}"}
+        insights = [f"⚠️ Error analyzing data: {str(e)[:50]}..."]
+    
+    if not insights:
+        insights = ["Select columns to see mapping insights"]
+    
+    return html.Div([
+        html.P("💡 Mapping Insights:", style={"fontWeight": "bold", "margin": "0 0 5px 0"}),
+        html.Ul([html.Li(insight) for insight in insights], style={"margin": "0", "paddingLeft": "20px"})
+    ])
 
 
-# Maps — UI state toggles
 @app.callback(
-    [Output("map-lat-col","disabled"),
-     Output("map-lon-col","disabled"),
-     Output("custom-geo-controls","style")],
-    [Input("map-type-selector","value"),
-     Input("geo-scope","value")]
+    Output("interactive-map", "figure"),
+    [Input("map-type-selector", "value"),
+     Input("map-location-col", "value"),
+     Input("map-value-col", "value"),
+     Input("map-lat-col", "value"),
+     Input("map-lon-col", "value"),
+     Input("uk-heatmap-style", "value"),
+     Input("dataset", "data")]
 )
-def toggle_map_controls(map_type, geo_scope):
-    is_scatter = (map_type == "scatter")
-    custom_style = {
-        "marginBottom": 15,
-        "backgroundColor": "#f8f9fa",
-        "padding": "10px",
-        "borderRadius": "8px",
-        # Show the custom block for both 'custom' and 'uk_auto' so users can upload/override
-        "display": "block" if geo_scope in ("custom", "uk_auto") else "none",
-    }
-    return (not is_scatter), (not is_scatter), custom_style
-
-
-# Maps — figure
-@app.callback(
-    Output("interactive-map","figure"),
-    [Input("map-type-selector","value"),
-     Input("geo-scope","value"),
-     Input("map-location-col","value"),
-     Input("map-value-col","value"),
-     Input("map-lat-col","value"),
-     Input("map-lon-col","value"),
-     Input("geojson-url","value"),
-     Input("geojson-featureid","value"),
-     Input("custom-id-col","value"),
-     Input("geojson-store","data"),
-     Input("dataset","data")]
-)
-def update_interactive_map(map_type, geo_scope, loc_col, val_col, lat_col, lon_col,
-                           geojson_url, featureidkey, custom_id_col, geojson_store, data):
+def update_interactive_map(map_type, loc_col, val_col, lat_col, lon_col, uk_style, data):
     if not data:
-        return go.Figure().add_annotation(text="Upload data to map.", showarrow=False, x=0.5, y=0.5)
+        return go.Figure().add_annotation(
+            text="Upload a CSV file to create maps", 
+            showarrow=False, x=0.5, y=0.5,
+            font=dict(size=16, color="#6c757d")
+        )
 
     df = pd.DataFrame(data)
 
-    # Coerce numeric if selected
-    if val_col is not None and val_col in df.columns:
-        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-
     try:
-        # ── Scatter map: requires lat & lon ────────────────────────────────────
-        if map_type == "scatter" and lat_col and lon_col:
-            return px.scatter_mapbox(
-                df.dropna(subset=[lat_col, lon_col]),
-                lat=lat_col, lon=lon_col,
-                color=val_col if val_col else None,
-                size=val_col if val_col else None,
-                hover_data=[loc_col] if loc_col else None,
-                mapbox_style="open-street-map", zoom=2, height=600,
-                title="Geographic Distribution"
+        # Convert value column to numeric if provided
+        if val_col and val_col in df.columns:
+            df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+        # World Choropleth
+        if map_type == "world_choropleth" and loc_col and val_col:
+            # Aggregate data by location
+            agg_df = df.groupby(loc_col, dropna=True)[val_col].sum().reset_index()
+            agg_df = agg_df[agg_df[val_col].notna()]
+            
+            if len(agg_df) == 0:
+                return go.Figure().add_annotation(
+                    text="No valid numeric data found for mapping", 
+                    showarrow=False, x=0.5, y=0.5
+                )
+            
+            # Determine location mode
+            location_type = guess_location_type(agg_df[loc_col])
+            locationmode_map = {
+                "ISO-3": "ISO-3",
+                "ISO-2": "ISO-2", 
+                "country names": "country names",
+                "USA-states": "country names",  # fallback
+                "UK-regions": "country names",  # fallback
+                "UK-postcodes": "country names"  # fallback
+            }
+            locationmode = locationmode_map.get(location_type, "country names")
+            
+            fig = px.choropleth(
+                agg_df,
+                locations=loc_col,
+                color=val_col,
+                locationmode=locationmode,
+                color_continuous_scale="Blues",
+                hover_name=loc_col,
+                hover_data={val_col: ":,.0f"},
+                title=f"{val_col} by {loc_col} (World View)"
             )
-
-        # ── Choropleth modes ───────────────────────────────────────────────────
-        if map_type == "choropleth" and loc_col and val_col:
-            # Aggregate per region
-            agg = df.groupby(loc_col, dropna=True)[val_col].sum(min_count=1).reset_index()
-            if agg[val_col].notna().sum() == 0:
-                return go.Figure().add_annotation(text="Value column must be numeric for choropleth.", showarrow=False, x=0.5, y=0.5)
-
-            # WORLD countries
-            if geo_scope == "world":
-                mode = guess_locationmode(agg[loc_col])
-                fig = px.choropleth(
-                    agg, locations=loc_col, color=val_col,
-                    locationmode=mode, hover_name=loc_col,
-                    color_continuous_scale="Blues", title=f"{val_col} by {loc_col}"
-                )
-                fig.update_geos(showframe=False, showcoastlines=True, projection_type="equirectangular")
-                fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-                return fig
-
-            # USA states
-            if geo_scope == "usa":
-                fig = px.choropleth(
-                    agg, locations=loc_col, color=val_col,
-                    locationmode="USA-states", scope="usa",
-                    color_continuous_scale="Blues", title=f"{val_col} by state"
-                )
-                fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-                return fig
-
-            # UK Local Authorities — auto (prefer uploaded/local; fallback to URLs)
-            if geo_scope == "uk_auto":
-                # Prefer uploaded file if present
-                if isinstance(geojson_store, dict) and geojson_store.get("geojson"):
-                    gj = geojson_store["geojson"]
-                    used_source = geojson_store.get("source", "upload")
-                else:
-                    try:
-                        gj, used_source = get_uk_lad_geojson()
-                    except Exception as e:
-                        msg = ("UK auto mode: no uploaded/local GeoJSON and all network fallbacks failed.<br>"
-                               "Upload a GeoJSON above or place one at <code>assets/uk_lad.geojson</code>.")
-                        return go.Figure().add_annotation(text=f"{msg}<br><br>Detail: {e}",
-                                                          showarrow=False, x=0.5, y=0.5)
-
-                fid = infer_featureidkey(gj, agg[loc_col]) or "properties.name"
-
-                fig = px.choropleth(
-                    agg, geojson=gj, locations=loc_col, color=val_col,
-                    featureidkey=fid, color_continuous_scale="Blues",
-                    hover_name=loc_col, title=f"{val_col} by {loc_col}"
-                )
-                fig.update_geos(fitbounds="locations", visible=False)
-                fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-
-                # Diagnostics: match count + source
-                try:
-                    prop_key = fid.split(".", 1)[1]
-                    gj_vals = {
-                        str(f["properties"][prop_key]).strip().upper()
-                        for f in gj.get("features", []) if f.get("properties") and f["properties"].get(prop_key) is not None
-                    }
-                    matches = sum(
-                        1 for v in agg[loc_col].astype(str).str.strip().str.upper()
-                        if v in gj_vals
-                    )
-                    fig.add_annotation(
-                        text=f"Matched {matches}/{len(agg)} regions • featureidkey={fid} • source={used_source}",
-                        xref="paper", yref="paper", x=0.01, y=0.01, showarrow=False, font=dict(size=10)
-                    )
-                except Exception:
-                    pass
-
-                return fig
-
-            # CUSTOM GeoJSON: uploaded → URL → instruct
-            if geo_scope == "custom":
-                if isinstance(geojson_store, dict) and geojson_store.get("geojson"):
-                    gj = geojson_store["geojson"]
-                    used_source = geojson_store.get("source", "upload")
-                elif geojson_url:
-                    if requests is None:
-                        return go.Figure().add_annotation(
-                            text="Custom GeoJSON needs 'requests'. Add it to dependencies or upload a file.",
-                            showarrow=False, x=0.5, y=0.5
-                        )
-                    try:
-                        gj = fetch_geojson(geojson_url)
-                        used_source = geojson_url
-                    except Exception as e:
-                        return go.Figure().add_annotation(text=f"Could not fetch GeoJSON: {e}", showarrow=False, x=0.5, y=0.5)
-                else:
-                    return go.Figure().add_annotation(
-                        text="Custom mode: upload a GeoJSON or provide a URL.", showarrow=False, x=0.5, y=0.5
-                    )
-
-                id_col = custom_id_col if custom_id_col else loc_col
-                fid = (featureidkey.strip() if featureidkey else None) or infer_featureidkey(gj, agg[id_col]) or "properties.name"
-
-                fig = px.choropleth(
-                    agg, geojson=gj, locations=id_col, color=val_col,
-                    featureidkey=fid, color_continuous_scale="Blues",
-                    hover_name=id_col, title=f"{val_col} by {id_col}"
-                )
-                fig.update_geos(fitbounds="locations", visible=False)
-                fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-
-                # Diagnostics
-                try:
-                    prop_key = fid.split(".", 1)[1]
-                    gj_vals = {
-                        str(f["properties"][prop_key]).strip().upper()
-                        for f in gj.get("features", []) if f.get("properties") and f["properties"].get(prop_key) is not None
-                    }
-                    matches = sum(1 for v in agg[id_col].astype(str).str.strip().str.upper() if v in gj_vals)
-                    fig.add_annotation(
-                        text=f"Matched {matches}/{len(agg)} regions • featureidkey={fid} • source={used_source}",
-                        xref="paper", yref="paper", x=0.01, y=0.01, showarrow=False, font=dict(size=10)
-                    )
-                except Exception:
-                    pass
-
-                return fig
-
-        # ── Regional Bar fallback ─────────────────────────────────────────────
-        if map_type == "bar" and loc_col and val_col:
-            tmp = df.groupby(loc_col, dropna=True)[val_col].sum(min_count=1).reset_index() \
-                    .sort_values(val_col, ascending=False).head(30)
-            fig = px.bar(tmp, x=loc_col, y=val_col, title=f"{val_col} by {loc_col}")
-            fig.update_xaxes(tickangle=45)
+            
+            fig.update_geos(
+                showframe=False,
+                showcoastlines=True,
+                projection_type="equirectangular"
+            )
+            
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=50, b=0),
+                height=600
+            )
+            
             return fig
 
-        # Instructional panel if inputs incomplete
-        txt = ("For Choropleth (World): region column = country names or ISO-2/ISO-3 codes.<br>"
-               "For Choropleth (USA): region column = 2-letter state codes (e.g., CA, NY).<br>"
-               "For UK (Local Authorities — auto): choose your UK region column (names or GSS codes), "
-               "or upload a UK LAD GeoJSON.<br>"
-               "For Custom: upload a GeoJSON or paste a URL; leave Feature ID empty to auto-detect.")
-        return go.Figure().add_annotation(text=txt, showarrow=False, x=0.5, y=0.5)
+        # US States Choropleth
+        elif map_type == "usa_choropleth" and loc_col and val_col:
+            # Aggregate data by location
+            agg_df = df.groupby(loc_col, dropna=True)[val_col].sum().reset_index()
+            agg_df = agg_df[agg_df[val_col].notna()]
+            
+            if len(agg_df) == 0:
+                return go.Figure().add_annotation(
+                    text="No valid numeric data found for mapping", 
+                    showarrow=False, x=0.5, y=0.5
+                )
+            
+            fig = px.choropleth(
+                agg_df,
+                locations=loc_col,
+                color=val_col,
+                locationmode="USA-states",
+                scope="usa",
+                color_continuous_scale="Blues",
+                hover_name=loc_col,
+                hover_data={val_col: ":,.0f"},
+                title=f"{val_col} by {loc_col} (US States)"
+            )
+            
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=50, b=0),
+                height=600
+            )
+            
+            return fig
+
+        # UK Regions/Councils - Interactive Heat Maps
+        elif map_type == "uk_choropleth" and loc_col and val_col:
+            # Aggregate data by location
+            agg_df = df.groupby(loc_col, dropna=True)[val_col].sum().reset_index()
+            agg_df = agg_df[agg_df[val_col].notna()]
+            agg_df = agg_df.sort_values(val_col, ascending=False)
+            
+            if len(agg_df) == 0:
+                return go.Figure().add_annotation(
+                    text="No valid numeric data found for UK mapping", 
+                    showarrow=False, x=0.5, y=0.5
+                )
+            
+            # Treemap Heat Map (Default and Recommended)
+            if uk_style == "treemap":
+                fig = px.treemap(
+                    agg_df.head(50),  # Top 50 regions
+                    path=[loc_col],
+                    values=val_col,
+                    color=val_col,
+                    color_continuous_scale="RdYlBu_r",  # Red-Yellow-Blue for heat map effect
+                    title=f"UK {val_col} Interactive Heat Map",
+                    hover_data={val_col: ":,.0f"}
+                )
+                
+                fig.update_traces(
+                    textinfo="label+value",
+                    texttemplate="<b>%{label}</b><br>£%{value:,.0f}",
+                    hovertemplate="<b>%{label}</b><br>" + val_col + ": £%{value:,.0f}<extra></extra>"
+                )
+                
+                fig.update_layout(
+                    height=600,
+                    margin=dict(l=0, r=0, t=50, b=10),
+                    font_size=11
+                )
+                
+                # Add instruction annotation
+                fig.add_annotation(
+                    text="🔥 Interactive Heat Map: Larger rectangles = higher values • Click to explore",
+                    xref="paper", yref="paper",
+                    x=0.02, y=0.98,
+                    showarrow=False,
+                    font=dict(size=12, color="#2c3e50"),
+                    align="left"
+                )
+                
+                return fig
+            
+            # Matrix Heat Map
+            elif uk_style == "matrix":
+                # Calculate grid dimensions for matrix
+                num_regions = min(len(agg_df), 49)  # Max 7x7 grid
+                agg_df_subset = agg_df.head(num_regions)
+                grid_size = math.ceil(math.sqrt(num_regions))
+                
+                # Create matrix data
+                matrix_data = np.zeros((grid_size, grid_size))
+                hover_labels = [["" for _ in range(grid_size)] for _ in range(grid_size)]
+                
+                for idx, (_, row) in enumerate(agg_df_subset.iterrows()):
+                    i = idx // grid_size
+                    j = idx % grid_size
+                    if i < grid_size and j < grid_size:
+                        matrix_data[i][j] = row[val_col]
+                        hover_labels[i][j] = f"{row[loc_col]}<br>£{row[val_col]:,.0f}"
+                
+                fig = go.Figure(data=go.Heatmap(
+                    z=matrix_data,
+                    text=hover_labels,
+                    hovertemplate='%{text}<extra></extra>',
+                    colorscale='RdYlBu_r',
+                    showscale=True,
+                    colorbar=dict(title=val_col)
+                ))
+                
+                fig.update_layout(
+                    title=f"UK {val_col} Matrix Heat Map",
+                    height=600,
+                    margin=dict(l=0, r=0, t=50, b=0),
+                    xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                    yaxis=dict(showticklabels=False, showgrid=False, zeroline=False)
+                )
+                
+                return fig
+            
+            # Horizontal Bars (fallback)
+            else:
+                fig = px.bar(
+                    agg_df.head(30),
+                    x=val_col,
+                    y=loc_col,
+                    orientation='h',
+                    title=f"UK {val_col} by {loc_col}",
+                    color=val_col,
+                    color_continuous_scale="RdYlBu_r",
+                    labels={val_col: val_col, loc_col: "UK Region/Council"}
+                )
+                
+                fig.update_layout(
+                    height=600,
+                    margin=dict(l=150, r=0, t=50, b=0),
+                    yaxis={'categoryorder': 'total ascending'},
+                    showlegend=False
+                )
+                
+                return fig
+
+        # Scatter Map
+        elif map_type == "scatter_map" and lat_col and lon_col:
+            map_df = df.dropna(subset=[lat_col, lon_col])
+            
+            if len(map_df) == 0:
+                return go.Figure().add_annotation(
+                    text="No valid latitude/longitude data found", 
+                    showarrow=False, x=0.5, y=0.5
+                )
+            
+            # Convert lat/lon to numeric
+            map_df[lat_col] = pd.to_numeric(map_df[lat_col], errors="coerce")
+            map_df[lon_col] = pd.to_numeric(map_df[lon_col], errors="coerce")
+            map_df = map_df.dropna(subset=[lat_col, lon_col])
+            
+            hover_data = {}
+            if loc_col:
+                hover_data[loc_col] = True
+            if val_col:
+                hover_data[val_col] = ":,.0f"
+            
+            fig = px.scatter_mapbox(
+                map_df,
+                lat=lat_col,
+                lon=lon_col,
+                color=val_col if val_col else None,
+                size=val_col if val_col else None,
+                hover_data=hover_data,
+                mapbox_style="open-street-map",
+                zoom=2,
+                height=600,
+                title="Geographic Distribution"
+            )
+            
+            fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+            return fig
+
+        # Regional Bar Chart
+        elif map_type == "regional_bar" and loc_col and val_col:
+            agg_df = df.groupby(loc_col, dropna=True)[val_col].sum().reset_index()
+            agg_df = agg_df.sort_values(val_col, ascending=False).head(20)
+            
+            fig = px.bar(
+                agg_df,
+                x=loc_col,
+                y=val_col,
+                title=f"Top Regions by {val_col}",
+                color=val_col,
+                color_continuous_scale="Blues"
+            )
+            
+            fig.update_xaxes(tickangle=45)
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=50, b=0),
+                height=600,
+                showlegend=False
+            )
+            
+            return fig
+
+        # Default instruction message
+        instructions = {
+            "world_choropleth": "Select a location column (countries) and a numeric value column",
+            "usa_choropleth": "Select a location column (US states) and a numeric value column",
+            "uk_choropleth": "Select a location column (UK councils/regions) and a numeric value column for heat maps", 
+            "scatter_map": "Select latitude, longitude, and optionally a value column",
+            "regional_bar": "Select a location column and a numeric value column"
+        }
+        
+        instruction_text = instructions.get(map_type, "Select appropriate columns for mapping")
+        
+        return go.Figure().add_annotation(
+            text=instruction_text,
+            showarrow=False, x=0.5, y=0.5,
+            font=dict(size=14, color="#6c757d")
+        )
+
     except Exception as e:
-        return go.Figure().add_annotation(text=f"Map error: {e}", showarrow=False, x=0.5, y=0.5)
+        return go.Figure().add_annotation(
+            text=f"Mapping error: {str(e)[:100]}...",
+            showarrow=False, x=0.5, y=0.5,
+            font=dict(size=12, color="#e74c3c")
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
